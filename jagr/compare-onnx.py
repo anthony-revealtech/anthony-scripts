@@ -10,6 +10,17 @@ import cv2
 import matplotlib.pyplot as plt
 
 
+
+jagr_data_dir = '/Users/antlowhur/Documents/Programming/jagr-data'
+
+# Load both models
+model1_path = os.path.join(jagr_data_dir, 'models', 'lightglue_1024kp.onnx')
+model2_path = os.path.join(jagr_data_dir, 'models', 'lightglue_1024kp_int16.onnx')
+
+model1_name = 'lightglue_1024kp'
+model2_name = 'lightglue_1024kp_int16'
+
+
 def prepare_features(image_a, image_b, max_kpts=1024):
     """Extract and prepare keypoints and descriptors from two images."""
     # Convert to grayscale for feature detection
@@ -123,7 +134,17 @@ def filter_valid_matches(match_pairs, kpts0_px, kpts1_px):
 
 
 def compare_matches(matches1, matches2):
-    """Compare two sets of matches and compute statistics."""
+    """Compare two sets of matches and compute statistics.
+    
+    Returns:
+        - overlap_ratio_model1: Fraction of model1's matches that are also in model2
+          (common / total_model1)
+        - overlap_ratio_model2: Fraction of model2's matches that are also in model1
+          (common / total_model2)
+        - jaccard_similarity: Intersection over union of both match sets
+          (common / (total_model1 + total_model2 - common))
+          This is symmetric and measures overall set similarity.
+    """
     set1 = set(matches1)
     set2 = set(matches2)
     
@@ -147,7 +168,7 @@ def compare_matches(matches1, matches2):
 def visualize_matches(image_a, image_b, kpts0_px, kpts1_px, matches, 
                      title, h_a, w_a, h_b, w_b, max_display=200):
     """Visualize matches between two images."""
-    fig, ax = plt.subplots(1, 1, figsize=(20, 10))
+    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
     
     # Combine images side by side
     h_combined = max(h_a, h_b)
@@ -183,7 +204,7 @@ def visualize_comparison(image_a, image_b, kpts0_px, kpts1_px,
                         matches1, matches2, comparison_stats,
                         model1_name, model2_name, h_a, w_a, h_b, w_b):
     """Create a side-by-side comparison visualization with overlap analysis."""
-    fig, axes = plt.subplots(2, 2, figsize=(24, 16))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
     # Prepare combined image
     h_combined = max(h_a, h_b)
@@ -270,15 +291,7 @@ def visualize_comparison(image_a, image_b, kpts0_px, kpts1_px,
 
 def main():
     """Main program."""
-    jagr_data_dir = '/Users/antlowhur/Documents/Programming/jagr-data'
-    
-    # Load both models
-    model1_path = os.path.join(jagr_data_dir, 'models', 'lightglue_1024kp.onnx')
-    model2_path = os.path.join(jagr_data_dir, 'models', 'lightglue_1024kp_int8.onnx')
-    
-    model1_name = 'lightglue_1024kp'
-    model2_name = 'lightglue_1024kp_quantized_adaptive'
-    
+
     print(f'Loading {model1_name}...')
     sess1 = onnxruntime.InferenceSession(model1_path, providers=['CPUExecutionProvider'])
     print(f'Loading {model2_name}...')
@@ -340,7 +353,7 @@ def main():
     print(f'Saved comparison visualization to: {output_path1}')
     
     # Visualization 2: Overlap analysis with detailed metrics
-    fig2, axes = plt.subplots(1, 2, figsize=(24, 10))
+    fig2, axes = plt.subplots(1, 2, figsize=(14, 6))
     
     # Left: Venn diagram style visualization
     ax = axes[0]
