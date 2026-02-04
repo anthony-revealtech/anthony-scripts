@@ -51,8 +51,8 @@ def prepare_image_for_aliked(image, target_size=(640, 640)):
 def main():
     """Main program."""
     jagr_data_dir = '/Users/antlowhur/Documents/Programming/jagr-data'
-    model_file_path = os.path.join(jagr_data_dir, 'models', 'aliked-n16_640x640_512kp.onnx')
-    #model_file_path = os.path.join(jagr_data_dir, 'models', 'aliked-n16_640x640_512kp_adaptive_quantization.onnx')
+    #model_file_path = os.path.join(jagr_data_dir, 'models', 'aliked-n16_640x640_512kp.onnx')
+    model_file_path = os.path.join(jagr_data_dir, 'models', 'aliked-n16_640x640_512kp_adaptive_quantization.onnx')
 
     # Create ONNX InferenceSession
     sess = onnxruntime.InferenceSession(model_file_path, providers=['CPUExecutionProvider'])
@@ -134,31 +134,59 @@ def main():
     if desc is not None:
         print(f'Descriptor dimensions: {desc.shape[1]}')
     
+    # Compare with OpenCV SIFT
+    print('\n' + '='*60)
+    print('COMPARING ALIKED vs SIFT')
+    print('='*60)
+    
+    # Run SIFT on the same image
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    sift = cv2.SIFT_create()
+    sift_kpts, sift_desc = sift.detectAndCompute(gray, None)
+    
+    aliked_count = len(kpts_px)
+    sift_count = len(sift_kpts) if sift_kpts is not None else 0
+    
+    print(f'ALIKED keypoints: {aliked_count}')
+    print(f'SIFT keypoints:   {sift_count}')
+    print(f'Difference:       {aliked_count - sift_count:+d} ({((aliked_count - sift_count) / max(sift_count, 1) * 100):+.1f}%)')
+    print(f'Ratio (ALIKED/SIFT): {aliked_count / max(sift_count, 1):.2f}x')
+    
     # Filter keypoints to only those within image bounds
     valid_mask = (kpts_px[:, 0] >= 0) & (kpts_px[:, 0] < w) & (kpts_px[:, 1] >= 0) & (kpts_px[:, 1] < h)
     kpts_valid = kpts_px[valid_mask]
     print(f'Valid keypoints within image bounds: {len(kpts_valid)}/{len(kpts_px)}')
     
-    # Visualization - keypoints on image
+    # Visualization - comparison of ALIKED vs SIFT
     print('\nCreating visualization...')
-    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
     
-    # Display image (imshow uses top-left origin, y increases downward)
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    ax.imshow(image_rgb)
     
-    # Plot only valid keypoints
-    # Note: matplotlib scatter uses the same coordinate system as imshow
+    # ALIKED visualization
+    ax = axes[0]
+    ax.imshow(image_rgb)
     ax.scatter(kpts_valid[:, 0], kpts_valid[:, 1], c='red', s=8, alpha=0.7, 
                edgecolors='darkred', linewidths=0.5, zorder=10)
-    
-    # Set axis limits to exactly match image dimensions to prevent auto-scaling
     ax.set_xlim(0, w)
-    ax.set_ylim(h, 0)  # y=0 at top, y=h at bottom (inverted for imshow)
-    
-    ax.set_title(f'ALIKED Feature Detection\n{len(kpts_valid)} keypoints detected (showing {len(kpts_valid)} valid)', 
-                fontsize=14, fontweight='bold')
+    ax.set_ylim(h, 0)
+    ax.set_title(f'ALIKED\n{aliked_count} keypoints', fontsize=12, fontweight='bold')
     ax.axis('off')
+    
+    # SIFT visualization
+    ax = axes[1]
+    ax.imshow(image_rgb)
+    if sift_kpts is not None:
+        sift_pts = np.array([kp.pt for kp in sift_kpts])
+        ax.scatter(sift_pts[:, 0], sift_pts[:, 1], c='cyan', s=8, alpha=0.7, 
+                   edgecolors='darkblue', linewidths=0.5, zorder=10)
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    ax.set_title(f'SIFT\n{sift_count} keypoints', fontsize=12, fontweight='bold')
+    ax.axis('off')
+    
+    plt.suptitle(f'Keypoint Detection Comparison: ALIKED ({aliked_count} keypoints) vs SIFT ({sift_count} keypoints)', 
+                fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.show()
 
