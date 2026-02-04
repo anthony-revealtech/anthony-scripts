@@ -11,20 +11,27 @@ import time
 from pathlib import Path
 
 
-def prepare_image_for_aliked(image, target_size=(640, 640)):
-    """Prepare image for ALIKED model input."""
-    # Convert BGR to RGB
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+def prepare_image_for_aliked(image, sess):
+    """Prepare image for ALIKED model input using proper preprocessing protocol.
+    
+    Args:
+        image: Input image (BGR format from cv2.imread)
+        sess: ONNX inference session to get input size dynamically
+    
+    Returns:
+        Preprocessed image tensor ready for model input in CHW format (1, 3, H, W)
+        and original image dimensions for coordinate mapping
+    """
+    # Get input size dynamically from model
+    input_shape = sess.get_inputs()[0].shape
+    input_size = input_shape[2:4]  # [height, width]
+    input_h, input_w = input_size[0], input_size[1]
     
     # Get original dimensions
-    orig_h, orig_w = image_rgb.shape[:2]
+    orig_h, orig_w = image.shape[:2]
     
-    # Resize to target size
-    image_resized = cv2.resize(image_rgb, target_size, interpolation=cv2.INTER_LINEAR)
-    
-    # Calculate scale factors for coordinate mapping
-    scale_x = orig_w / target_size[0]
-    scale_y = orig_h / target_size[1]
+    # Resize to model input size (cv2.resize expects (width, height))
+    image_resized = cv2.resize(image, (input_w, input_h), interpolation=cv2.INTER_LINEAR)
     
     # Normalize to [0, 1] range
     image_normalized = image_resized.astype(np.float32) / 255.0
@@ -33,17 +40,21 @@ def prepare_image_for_aliked(image, target_size=(640, 640)):
     image_chw = np.transpose(image_normalized, (2, 0, 1))
     
     # Add batch dimension: (1, 3, H, W)
-    image_batched = image_chw[np.newaxis, :, :, :]
+    image_batched = np.expand_dims(image_chw, axis=0)
     
-    return image_batched, scale_x, scale_y
+    return image_batched, orig_h, orig_w, input_h, input_w
 
 
 def process_aliked(image, sess):
-    """Process image with ALIKED and return keypoints and descriptors."""
+    """Process image with ALIKED and return keypoints and descriptors.
+    
+    ALIKED outputs keypoints in [-1, 1] normalized coordinates that need to be
+    converted to pixel coordinates based on the original image dimensions.
+    """
     h, w = image.shape[:2]
     
-    # Prepare image
-    image_prep, scale_x, scale_y = prepare_image_for_aliked(image)
+    # Prepare image using proper preprocessing protocol
+    image_prep, orig_h, orig_w, input_h, input_w = prepare_image_for_aliked(image, sess)
     
     # Run ALIKED
     outputs = sess.run(None, {'image': image_prep})
@@ -56,15 +67,11 @@ def process_aliked(image, sess):
     if desc is not None and len(desc.shape) == 3:
         desc = desc[0]
     
-    # Convert to pixel coordinates
+    # Convert keypoints from [-1, 1] normalized coordinates to pixel coordinates
+    # Based on the provided script: kpts[:, 0] = (kpts[:, 0] + 1) * 0.5 * w
     kpts_px = kpts_norm.copy()
-    max_val = max(kpts_px[:, 0].max(), kpts_px[:, 1].max())
-    if max_val <= 1.0:
-        kpts_px[:, 0] = kpts_px[:, 0] * 640.0 * scale_x
-        kpts_px[:, 1] = kpts_px[:, 1] * 640.0 * scale_y
-    else:
-        kpts_px[:, 0] = kpts_px[:, 0] * scale_x
-        kpts_px[:, 1] = kpts_px[:, 1] * scale_y
+    kpts_px[:, 0] = (kpts_px[:, 0] + 1) * 0.5 * orig_w  # Convert x from [-1,1] to [0, w]
+    kpts_px[:, 1] = (kpts_px[:, 1] + 1) * 0.5 * orig_h  # Convert y from [-1,1] to [0, h]
     
     # Filter valid keypoints
     valid_mask = (kpts_px[:, 0] >= 0) & (kpts_px[:, 0] < w) & (kpts_px[:, 1] >= 0) & (kpts_px[:, 1] < h)
@@ -173,11 +180,11 @@ def draw_matches(frame, kpts0, kpts1, matches, offset_x, color=(0, 255, 0), max_
             pt0 = (int(kpts0[i0][0]), int(kpts0[i0][1]))
             pt1 = (int(kpts1[i1][0] + offset_x), int(kpts1[i1][1]))
             
-            # Draw line
-            cv2.line(frame, pt0, pt1, color, 1)
-            # Draw keypoints
-            cv2.circle(frame, pt0, 3, color, -1)
-            cv2.circle(frame, pt1, 3, color, -1)
+            # Draw line (10x thicker)
+            cv2.line(frame, pt0, pt1, color, 10)
+            # Draw keypoints (larger for visibility)
+            cv2.circle(frame, pt0, 8, color, -1)
+            cv2.circle(frame, pt1, 8, color, -1)
     
     return frame
 
@@ -186,6 +193,10 @@ def main():
     """Main program."""
     jagr_data_dir = '/Users/antlowhur/Documents/Programming/jagr-data'
     image_dir = '/Users/antlowhur/Documents/Programming/theia/data/SWAMP_EO_(ANAFI)_ Flight_3'
+    
+    # Output video path (set to None to disable saving)
+    output_video_path = os.path.join(jagr_data_dir, 'feature_mapping_comparison.mp4')
+    save_video = True  # Set to False to disable video saving
     
     # Model paths
     aliked_orig_path = os.path.join(jagr_data_dir, 'models', 'aliked-n16_640x640_512kp.onnx')
@@ -221,6 +232,10 @@ def main():
     prev_kpts_quant = None
     prev_desc_quant = None
     
+    # Video writer (will be initialized after first frame)
+    video_writer = None
+    video_fps = 2.0  # Frames per second for output video
+    
     for i, image_path in enumerate(image_files):
         if i % frame_skip != 0:
             continue
@@ -253,7 +268,7 @@ def main():
             matches_orig = run_lightglue(lightglue_orig_sess, kpts0_orig, kpts1_orig, desc0_orig, desc1_orig)
             matches_quant = run_lightglue(lightglue_quant_sess, kpts0_quant, kpts1_quant, desc0_quant, desc1_quant)
             
-            # Filter valid matches
+            # Filter valid matches (by index bounds only)
             valid_matches_orig = [(i0, i1) for i0, i1 in matches_orig 
                                  if i0 < n0_orig and i1 < n1_orig]
             valid_matches_quant = [(i0, i1) for i0, i1 in matches_quant 
@@ -280,34 +295,45 @@ def main():
             combined_orig[:prev_h, :prev_w] = prev_image
             combined_orig[:h, prev_w:] = image
             
-            # Draw matches for quantized models (top)
+            # Draw matches for quantized models (top) - green
             frame_quant = draw_matches(combined_quant, prev_kpts_quant, kpts_quant, 
-                                      valid_matches_quant, prev_w, color=(255, 0, 255), max_display=200)
+                                      valid_matches_quant, prev_w, color=(0, 255, 0), max_display=200)  # Green
             
-            # Draw matches for original models (bottom)
+            # Draw matches for original models (bottom) - dark blue
             frame_orig = draw_matches(combined_orig, prev_kpts_orig, kpts_orig, 
-                                     valid_matches_orig, prev_w, color=(0, 255, 0), max_display=200)
+                                     valid_matches_orig, prev_w, color=(0, 0, 200), max_display=200)  # Dark blue (BGR)
             
             # Combine quantized (top) and original (bottom) vertically
             final_frame = np.vstack([frame_quant, frame_orig])
             
-            # Add text with match counts
+            # Add text with match counts (5x bigger font)
             font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.8
-            thickness = 2
+            font_scale = 4.0  # 5x bigger (0.8 * 5 = 4.0)
+            thickness = 10  # Thicker text for visibility
             
-            # Quantized models text (top of video)
+            # Quantized models text (top of video) - green (moved down to avoid cutoff)
             text_quant = f'Quantized model: {match_count_quant} matches'
-            cv2.putText(final_frame, text_quant, (10, 30), font, font_scale, (255, 0, 255), thickness)
+            cv2.putText(final_frame, text_quant, (10, 120), font, font_scale, (0, 255, 0), thickness)  # Green
             
-            # Original models text (bottom of video, at the start of bottom panel)
+            # Original models text (bottom of video, at the start of bottom panel) - dark blue
             text_orig = f'Original: {match_count_orig} matches'
-            cv2.putText(final_frame, text_orig, (10, h_combined + 30), font, font_scale, (0, 255, 0), thickness)
+            cv2.putText(final_frame, text_orig, (10, h_combined + 120), font, font_scale, (0, 0, 200), thickness)  # Dark blue (BGR)
             
             # Frame info (at very bottom)
             frame_text = f'Frame pair: {frame_count} | Images: {i-1} -> {i}'
             cv2.putText(final_frame, frame_text, (10, final_frame.shape[0] - 10), 
                       font, 0.6, (255, 255, 255), 1)
+            
+            # Initialize video writer on first frame
+            if save_video and video_writer is None:
+                h_out, w_out = final_frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                video_writer = cv2.VideoWriter(output_video_path, fourcc, video_fps, (w_out, h_out))
+                print(f'\nSaving video to: {output_video_path}')
+            
+            # Write frame to video
+            if save_video and video_writer is not None:
+                video_writer.write(final_frame)
             
             # Display
             cv2.imshow('Feature Mapping: Original vs Quantized', final_frame)
@@ -326,6 +352,12 @@ def main():
         prev_desc_quant = desc_quant
     
     cv2.destroyAllWindows()
+    
+    # Release video writer
+    if save_video and video_writer is not None:
+        video_writer.release()
+        print(f'\nVideo saved to: {output_video_path}')
+    
     print(f'\nProcessed {frame_count} frame pairs')
 
 
