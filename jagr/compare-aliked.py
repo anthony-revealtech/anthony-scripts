@@ -8,6 +8,9 @@ import os
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+from scipy.spatial.distance import cdist
+from sklearn.metrics.pairwise import cosine_similarity
+from pathlib import Path
 
 
 
@@ -86,47 +89,101 @@ def process_aliked_model(image, sess, model_name):
     return kpts_valid, desc_valid
 
 
-def main():
-    """Main program."""
-    jagr_data_dir = '/Users/antlowhur/Documents/Programming/jagr-data'
+def compute_cosine_similarity(kpts_orig, desc_orig, kpts_quant, desc_quant, spatial_threshold=10.0):
+    """Compute cosine similarity between original and quantized keypoints.
     
-    # Model paths
-    aliked_orig_path = os.path.join(jagr_data_dir, 'models', 'aliked-n16_640x640_512kp.onnx')
-    aliked_quant_path = os.path.join(jagr_data_dir, 'models', 'aliked-n16_640x640_512kp_adaptive_quantization.onnx')
+    Matches keypoints spatially and computes descriptor cosine similarity.
     
-    print('Loading ALIKED models...')
-    print('  Loading original model...')
-    aliked_orig_sess = onnxruntime.InferenceSession(aliked_orig_path, providers=['CPUExecutionProvider'])
-    print('  Loading quantized model...')
-    aliked_quant_sess = onnxruntime.InferenceSession(aliked_quant_path, providers=['CPUExecutionProvider'])
-    print('Models loaded!\n')
+    Args:
+        kpts_orig: Original keypoints (N, 2)
+        desc_orig: Original descriptors (N, D)
+        kpts_quant: Quantized keypoints (M, 2)
+        desc_quant: Quantized descriptors (M, D)
+        spatial_threshold: Maximum distance in pixels to consider a match
     
-    # Print model info
-    print('Original model info:')
-    input_info = aliked_orig_sess.get_inputs()
-    output_info = aliked_orig_sess.get_outputs()
-    print('  Inputs: ', [(inp.name, inp.shape, inp.type) for inp in input_info])
-    print('  Outputs:', [(out.name, out.shape, out.type) for out in output_info])
+    Returns:
+        matched_pairs: List of (orig_idx, quant_idx) tuples for matched keypoints
+        similarities: Cosine similarities for matched pairs
+        avg_similarity: Average cosine similarity
+    """
+    if desc_orig is None or desc_quant is None:
+        print("  Warning: Descriptors not available, cannot compute cosine similarity")
+        return [], [], 0.0
+    
+    if len(kpts_orig) == 0 or len(kpts_quant) == 0:
+        print("  Warning: No keypoints to compare")
+        return [], [], 0.0
+    
+    # Compute spatial distances between all keypoint pairs
+    distances = cdist(kpts_orig, kpts_quant, metric='euclidean')
+    
+    # Find nearest quantized keypoint for each original keypoint
+    matched_pairs = []
+    similarities = []
+    
+    for orig_idx in range(len(kpts_orig)):
+        # Find nearest quantized keypoint
+        nearest_quant_idx = np.argmin(distances[orig_idx])
+        distance = distances[orig_idx, nearest_quant_idx]
+        
+        # Only match if within spatial threshold
+        if distance <= spatial_threshold:
+            matched_pairs.append((orig_idx, nearest_quant_idx))
+            
+            # Compute cosine similarity of descriptors
+            desc_o = desc_orig[orig_idx:orig_idx+1]  # Keep 2D shape
+            desc_q = desc_quant[nearest_quant_idx:nearest_quant_idx+1]
+            
+            # Normalize descriptors for cosine similarity
+            desc_o_norm = desc_o / (np.linalg.norm(desc_o, axis=1, keepdims=True) + 1e-8)
+            desc_q_norm = desc_q / (np.linalg.norm(desc_q, axis=1, keepdims=True) + 1e-8)
+            
+            # Compute cosine similarity
+            similarity = cosine_similarity(desc_o_norm, desc_q_norm)[0, 0]
+            similarities.append(similarity)
+    
+    # Compute average similarity
+    avg_similarity = np.mean(similarities) if len(similarities) > 0 else 0.0
+    
+    return matched_pairs, similarities, avg_similarity
+
+
+def get_image_files(directory):
+    """Get sorted list of image files from directory."""
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif'}
+    files = []
+    for ext in image_extensions:
+        files.extend(Path(directory).glob(f'*{ext}'))
+        files.extend(Path(directory).glob(f'*{ext.upper()}'))
+    return sorted(files)
+
+
+def process_single_image(image_path, aliked_orig_sess, aliked_quant_sess, show_plot=True):
+    """Process a single image and compare original vs quantized models."""
+    print(f'\n{"="*60}')
+    print(f'Processing: {image_path.name}')
+    print(f'{"="*60}')
     
     # Load image
-    image = cv2.imread(os.path.join(jagr_data_dir, 'data', 'P0130132.JPG'))
+    image = cv2.imread(str(image_path))
     
     if image is None:
-        raise ValueError("Failed to load image")
+        print(f'  Warning: Failed to load {image_path.name}, skipping...')
+        return None
     
     # Store original dimensions for visualization
     h, w = image.shape[:2]
-    print(f'\nImage dimensions: {w}x{h}\n')
+    print(f'Image dimensions: {w}x{h}')
     
     # Process with both models
-    print('Processing image with both models...')
+    print('\nProcessing image with both models...')
     kpts_orig, desc_orig = process_aliked_model(image, aliked_orig_sess, 'Original')
     kpts_quant, desc_quant = process_aliked_model(image, aliked_quant_sess, 'Quantized')
     
     # Compare results
-    print('\n' + '='*60)
+    print('\n' + '-'*60)
     print('COMPARING ORIGINAL vs QUANTIZED')
-    print('='*60)
+    print('-'*60)
     
     orig_count = len(kpts_orig)
     quant_count = len(kpts_quant)
@@ -137,36 +194,134 @@ def main():
     if quant_count > 0:
         print(f'Ratio (Orig/Quant):    {orig_count / quant_count:.2f}x')
     
+    # Compute cosine similarity
+    print('\nComputing cosine similarity...')
+    matched_pairs, similarities, avg_similarity = compute_cosine_similarity(
+        kpts_orig, desc_orig, kpts_quant, desc_quant, spatial_threshold=10.0
+    )
+    
+    if len(matched_pairs) > 0:
+        print(f'Matched keypoints:    {len(matched_pairs)}/{orig_count} ({len(matched_pairs)/max(orig_count, 1)*100:.1f}%)')
+        print(f'Average cosine similarity: {avg_similarity:.4f}')
+        print(f'Min similarity:        {np.min(similarities):.4f}')
+        print(f'Max similarity:        {np.max(similarities):.4f}')
+        print(f'Std similarity:        {np.std(similarities):.4f}')
+    else:
+        print('No matched keypoints found within spatial threshold')
+    
     # Visualization - comparison of Original vs Quantized
-    print('\nCreating visualization...')
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    if show_plot:
+        print('\nCreating visualization...')
+        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+        
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Original model visualization
+        ax = axes[0]
+        ax.imshow(image_rgb)
+        ax.scatter(kpts_orig[:, 0], kpts_orig[:, 1], c='red', s=8, alpha=0.7, 
+                   edgecolors='black', linewidths=0.5, zorder=10)
+        ax.set_xlim(0, w)
+        ax.set_ylim(h, 0)
+        ax.set_title(f'Original ALIKED\n{orig_count} keypoints', fontsize=12, fontweight='bold')
+        ax.axis('off')
+        
+        # Quantized model visualization
+        ax = axes[1]
+        ax.imshow(image_rgb)
+        ax.scatter(kpts_quant[:, 0], kpts_quant[:, 1], c='lightblue', s=8, alpha=0.7, 
+                   edgecolors='black', linewidths=0.5, zorder=10)
+        ax.set_xlim(0, w)
+        ax.set_ylim(h, 0)
+        ax.set_title(f'Quantized ALIKED\n{quant_count} keypoints', fontsize=12, fontweight='bold')
+        ax.axis('off')
+        
+        # Add similarity info to title
+        similarity_text = f'Avg Cosine Similarity: {avg_similarity:.4f}' if len(matched_pairs) > 0 else 'No matches'
+        plt.suptitle(f'{image_path.name}: Original ({orig_count} keypoints) vs Quantized ({quant_count} keypoints)\n{similarity_text}', 
+                    fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
     
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    # Return statistics
+    return {
+        'image_name': image_path.name,
+        'orig_count': orig_count,
+        'quant_count': quant_count,
+        'matched_count': len(matched_pairs),
+        'avg_similarity': avg_similarity,
+        'min_similarity': np.min(similarities) if len(similarities) > 0 else 0.0,
+        'max_similarity': np.max(similarities) if len(similarities) > 0 else 0.0,
+        'std_similarity': np.std(similarities) if len(similarities) > 0 else 0.0
+    }
+
+
+def main():
+    """Main program."""
+    jagr_data_dir = '/Users/antlowhur/Documents/Programming/jagr-data'
+    image_dir = '/Users/antlowhur/Documents/Programming/jagr-data/data/vanafi_polygon_6_18_2020_300msq_121m_altitude/data'
     
-    # Original model visualization
-    ax = axes[0]
-    ax.imshow(image_rgb)
-    ax.scatter(kpts_orig[:, 0], kpts_orig[:, 1], c='red', s=8, alpha=0.7, 
-               edgecolors='black', linewidths=0.5, zorder=10)
-    ax.set_xlim(0, w)
-    ax.set_ylim(h, 0)
-    ax.set_title(f'Original ALIKED\n{orig_count} keypoints', fontsize=12, fontweight='bold')
-    ax.axis('off')
+    # Model paths
+    aliked_orig_path = os.path.join(jagr_data_dir, 'models', 'aliked-n16_640x640_512kp.onnx')
+    aliked_quant_path = os.path.join(jagr_data_dir, 'models', 'aliked-n16_640x640_512kp_INT16.onnx')
     
-    # Quantized model visualization
-    ax = axes[1]
-    ax.imshow(image_rgb)
-    ax.scatter(kpts_quant[:, 0], kpts_quant[:, 1], c='lightblue', s=8, alpha=0.7, 
-               edgecolors='black', linewidths=0.5, zorder=10)
-    ax.set_xlim(0, w)
-    ax.set_ylim(h, 0)
-    ax.set_title(f'Quantized ALIKED\n{quant_count} keypoints', fontsize=12, fontweight='bold')
-    ax.axis('off')
+    print('Loading ALIKED models...')
+    print('  Loading original model...')
+    aliked_orig_sess = onnxruntime.InferenceSession(aliked_orig_path, providers=['CPUExecutionProvider'])
+    print('  Loading quantized model...')
+    aliked_quant_sess = onnxruntime.InferenceSession(aliked_quant_path, providers=['CPUExecutionProvider'])
+    print('Models loaded!\n')
     
-    plt.suptitle(f'ALIKED Model Comparison: Original ({orig_count} keypoints) vs Quantized ({quant_count} keypoints)', 
-                fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.show()
+    # Get image files from directory
+    image_files = get_image_files(image_dir)
+    
+    if len(image_files) == 0:
+        raise ValueError(f"No image files found in directory: {image_dir}")
+    
+    print(f'Found {len(image_files)} images in directory\n')
+    
+    # Process each image
+    all_stats = []
+    show_plot = True  # Set to False to skip individual plots
+    
+    for i, image_path in enumerate(image_files):
+        stats = process_single_image(image_path, aliked_orig_sess, aliked_quant_sess, show_plot=show_plot)
+        if stats is not None:
+            all_stats.append(stats)
+        
+        # Optionally pause between images (comment out to process all automatically)
+        # input("Press Enter to continue to next image...")
+    
+    # Print aggregate statistics
+    if len(all_stats) > 0:
+        print('\n' + '='*60)
+        print('AGGREGATE STATISTICS ACROSS ALL IMAGES')
+        print('='*60)
+        
+        avg_orig_count = np.mean([s['orig_count'] for s in all_stats])
+        avg_quant_count = np.mean([s['quant_count'] for s in all_stats])
+        avg_matched = np.mean([s['matched_count'] for s in all_stats])
+        
+        # Calculate average cosine similarity (only for images with matches)
+        similarities = [s['avg_similarity'] for s in all_stats if s['avg_similarity'] > 0]
+        avg_similarity = np.mean(similarities) if len(similarities) > 0 else 0.0
+        std_similarity = np.std(similarities) if len(similarities) > 0 else 0.0
+        
+        print(f'Total images processed: {len(all_stats)}')
+        print(f'Average original keypoints:   {avg_orig_count:.1f}')
+        print(f'Average quantized keypoints:  {avg_quant_count:.1f}')
+        print(f'Average matched keypoints:    {avg_matched:.1f}')
+        print()
+        print('COSINE SIMILARITY STATISTICS:')
+        print('-' * 60)
+        print(f'Average cosine similarity:    {avg_similarity:.4f}')
+        print(f'Standard deviation:           {std_similarity:.4f}')
+        if len(similarities) > 0:
+            print(f'Min similarity across images: {min(similarities):.4f}')
+            print(f'Max similarity across images: {max(similarities):.4f}')
+            print(f'Images with matches:          {len(similarities)}/{len(all_stats)} ({len(similarities)/len(all_stats)*100:.1f}%)')
+        else:
+            print('No matches found across any images')
 
 
 if __name__ == '__main__':
