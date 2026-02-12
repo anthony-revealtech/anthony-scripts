@@ -1,13 +1,15 @@
 """
-Compare ONNX (ALIKED) vs TFLite (ALIKED) feature detection on images.
-Runs both models on the same images and computes spatial overlap and repeatability metrics.
-
-Note: lightglue_1024kp.onnx is a matcher (inputs: kpts0, kpts1, desc0, desc1), not a detector,
-so it cannot be used for single-image keypoint detection. This script uses ALIKED ONNX vs ALIKED TFLite.
+Compare two ALIKED-style keypoint models on the same images (spatial overlap, repeatability, cosine similarity).
+Supports:
+  - .onnx  -> ONNX Runtime
+  - .tflite -> TFLite (tflite_runtime or tensorflow.lite)
+  - .pth   -> PyTorch (requires ALIKED model class; set PYTHONPATH to ALIKED repo if needed)
+Set model_a_path and model_b_path below (or override via env MODEL_A_PATH / MODEL_B_PATH).
 """
 
 import onnxruntime
 import os
+import sys
 import numpy as np
 import cv2
 from pathlib import Path
@@ -15,21 +17,27 @@ from pathlib import Path
 jagr_data_base = '/Users/antlowhur/Documents/Programming/jagr-data/'
 image_dir = os.path.join(jagr_data_base, 'data/vanafi_polygon_6_18_2020_300msq_121m_altitude/data/')
 
-# ONNX: ALIKED detector  |  TFLite: ALIKED fp16 (same detector, different runtimes)
-model_onnx_path = '/Users/antlowhur/Documents/Programming/jagr-data/models/aliked-n16_640x640_512kp.onnx'
-model_tflite_path = '/Users/antlowhur/Documents/Programming/jagr-data/models/aliked-n16_fp16.tflite'
+# Two models to compare; type is inferred from extension (.onnx, .tflite, .pth)
+# In the overlay: A-only = blue, B-only = red, overlapping = green.
 
-# TFLite runtime (optional; set SKIP_TFLITE=1 to run ONNX only)
-SKIP_TFLITE = os.environ.get('SKIP_TFLITE', '').strip().lower() in ('1', 'true', 'yes')
+model_a_path = os.environ.get('MODEL_A_PATH', '/Users/antlowhur/Documents/Programming/jagr-data/models/aliked-n16_640x640_512kp.onnx').strip()  # blue
+#model_b_path = os.environ.get('MODEL_B_PATH', '/Users/antlowhur/Documents/Programming/jagr-data/models/aliked-n16_fp16.tflite').strip()
+model_b_path = os.environ.get('MODEL_B_PATH', '/Users/antlowhur/Documents/Programming/jagr-data/models/aliked-n16.pth').strip()  # red
+
+
+#model_a_path = os.environ.get('MODEL_B_PATH', '/Users/antlowhur/Documents/Programming/jagr-data/models/aliked-n16_fp16.tflite').strip()
+#model_b_path = os.environ.get('MODEL_B_PATH', '/Users/antlowhur/Documents/Programming/jagr-data/models/aliked-n16.pth').strip()
+
+
+# TFLite runtime (loaded only when a .tflite path is used)
 _tflite_module = None
-if not SKIP_TFLITE:
+try:
+    import tflite_runtime.interpreter as _tflite_module
+except ImportError:
     try:
-        import tflite_runtime.interpreter as _tflite_module
+        import tensorflow.lite as _tflite_module
     except ImportError:
-        try:
-            import tensorflow.lite as _tflite_module
-        except ImportError:
-            pass
+        pass
 
 # Model input resolution (height, width) for detection. Must match the loaded ONNX model.
 # Use None or -1 for either to use the original input resolution (padded square, no resize).
@@ -243,14 +251,225 @@ def process_frame_onnx(frame, sess):
 
 def _load_tflite_interpreter(model_path):
     """Load TFLite interpreter."""
-    errors = []
-    try:
-        interp = _tflite_module.Interpreter(model_path=model_path)
-        interp.allocate_tensors()
-        return interp
-    except Exception as e:
-        errors.append(str(e))
+    if _tflite_module is None:
+        raise ImportError("TFLite runtime not found. Install tflite-runtime or tensorflow.")
+    interp = _tflite_module.Interpreter(model_path=model_path)
+    interp.allocate_tensors()
+    return interp
+
+
+def _find_aliked_root():
+    """Find ALIKED repo root: ALIKED_ROOT/ALIKED_PATH env, then sys.path (directory that has nets/ and custom_ops/)."""
+    # Prefer explicit env so user doesn't have to set PYTHONPATH
+    for env_name in ('ALIKED_ROOT', 'ALIKED_PATH'):
+        p = os.environ.get(env_name, '').strip()
+        if not p:
+            continue
+        root = Path(p).resolve()
+        if root.is_dir() and (root / 'nets' / 'aliked.py').is_file() and (root / 'custom_ops').is_dir():
+            if str(root) not in sys.path:
+                sys.path.insert(0, str(root))
+            return root
+    for p in sys.path:
+        if not p or p == '':
+            continue
+        root = Path(p).resolve()
+        if not root.is_dir():
+            continue
+        if (root / 'nets' / 'aliked.py').is_file() and (root / 'custom_ops').is_dir():
+            return root
+        if (root / 'nets' / '__init__.py').is_file() and (root / 'custom_ops').is_dir():
+            return root
     return None
+
+
+def _load_custom_ops_so_before_import():
+    """Load ALIKED custom_ops .so from ALIKED repo if available. Never raises; returns False if .so missing or fails (script will use pure-PyTorch fallback in custom_ops/__init__.py)."""
+    import torch
+    if getattr(torch.ops, 'custom_ops', None) is not None and getattr(torch.ops.custom_ops, 'get_patches_forward', None) is not None:
+        return True
+    aliked_root = _find_aliked_root()
+    if aliked_root is None:
+        return False
+    custom_ops_dir = aliked_root / 'custom_ops'
+    all_so = sorted(custom_ops_dir.glob('get_patches*.so'))
+    py_tag = f"cpython-{sys.version_info.major}{sys.version_info.minor}"
+    so_files = [s for s in all_so if py_tag in s.name]
+    if not so_files:
+        so_files = all_so
+    last_err = None
+    for so in so_files:
+        try:
+            torch.ops.load_library(str(so))
+            return True
+        except Exception as e:
+            last_err = e
+            continue
+    # .so not available or ABI mismatch: custom_ops will use pure-PyTorch get_patches when we import nets.aliked
+    if so_files or last_err:
+        import warnings
+        warnings.warn(
+            f"ALIKED custom_ops .so could not be loaded ({last_err}). Using pure-PyTorch get_patches (slower but works).",
+            UserWarning,
+            stacklevel=2,
+        )
+    return False
+
+
+def _get_aliked_pytorch_model_class():
+    """Try to import ALIKED model class from common locations (e.g. ALIKED repo on PYTHONPATH)."""
+    try:
+        from nets.aliked import ALIKED
+        return ALIKED
+    except ImportError:
+        pass
+    try:
+        from model import ALIKED
+        return ALIKED
+    except ImportError:
+        pass
+    try:
+        from alike import ALIKED
+        return ALIKED
+    except ImportError:
+        pass
+    raise ImportError(
+        "For .pth models, the ALIKED PyTorch model class is required. "
+        "Clone https://github.com/Shiaoming/ALIKED and add it to PYTHONPATH, e.g.:\n"
+        "  export PYTHONPATH=/path/to/ALIKED:$PYTHONPATH"
+    )
+
+
+def _load_pytorch_model(model_path):
+    """Load ALIKED PyTorch weights (.pth). Returns (model, device). Uses CPU when no GPU or FORCE_CPU=1."""
+    import torch
+    # Ensure ALIKED root is on sys.path (so "from nets.aliked import ALIKED" and custom_ops work)
+    aliked_root = _find_aliked_root()
+    if aliked_root is None:
+        aliked_example = '/Users/antlowhur/Documents/Programming/optimization-scripts/onnx-experiments/torch/ALIKED'
+        raise RuntimeError(
+            "ALIKED PyTorch (.pth) requires the ALIKED repo. Set ALIKED_ROOT and run again:\n"
+            f"  export ALIKED_ROOT={aliked_example}"
+        )
+    # Optional: load .so if available (faster). If not, custom_ops uses pure PyTorch fallback.
+    _load_custom_ops_so_before_import()
+    ALIKED = _get_aliked_pytorch_model_class()
+    use_cuda = torch.cuda.is_available() and os.environ.get('FORCE_CPU', '').strip().lower() not in ('1', 'true', 'yes')
+    device = torch.device('cuda' if use_cuda else 'cpu')
+    name = Path(model_path).stem.lower()
+    model_name = 'aliked-n16' if 'n16' in name or 'n16' in model_path else 'aliked-n16'
+    try:
+        state = torch.load(model_path, map_location=device, weights_only=True)
+    except TypeError:
+        state = torch.load(model_path, map_location=device)
+    if isinstance(state, dict) and 'state_dict' in state:
+        state = state['state_dict']
+    # Try common constructor signatures
+    try:
+        model = ALIKED(model_name=model_name, device=str(device))
+    except TypeError:
+        try:
+            model = ALIKED(device=str(device))
+        except TypeError:
+            model = ALIKED()
+    model.load_state_dict(state, strict=False)
+    model.to(device)
+    model.eval()
+    # custom_ops may use C++ .so or pure-PyTorch fallback; no need to require get_patches_forward here
+    return model, device
+
+
+def process_frame_pytorch(frame, model, device):
+    """Process frame with ALIKED PyTorch model; returns keypoints and descriptors in original image coords."""
+    import torch
+    orig_h, orig_w = frame.shape[:2]
+    frame_prep, orig_h, orig_w, _, _, pad_left, pad_top, max_dim = prepare_image_pad_resize(
+        frame, MODEL_INPUT_HEIGHT, MODEL_INPUT_WIDTH
+    )
+    x = torch.from_numpy(frame_prep).float().to(device)
+    # ALIKED forward() may call torch.cuda.synchronize(); no-op when CUDA not available
+    _orig_sync = None
+    if not torch.cuda.is_available():
+        _orig_sync = getattr(torch.cuda, 'synchronize', None)
+        if _orig_sync is not None:
+            torch.cuda.synchronize = lambda: None
+    try:
+        with torch.no_grad():
+            out = model(x)
+    except AttributeError as e:
+        if 'get_patches_forward' in str(e) or 'custom_ops' in str(e):
+            raise RuntimeError(
+                "ALIKED PyTorch requires the custom_ops extension (get_patches_forward). "
+                "Build it from the ALIKED repo (see custom_ops/), or use the ONNX or TFLite model instead."
+            ) from e
+        raise
+    finally:
+        if _orig_sync is not None:
+            torch.cuda.synchronize = _orig_sync
+    if isinstance(out, dict):
+        kpts_norm = out.get('keypoints', out.get('kp', out.get('keypoint')))
+        desc = out.get('descriptors', out.get('desc', out.get('descriptor')))
+    else:
+        kpts_norm = out[0] if len(out) > 0 else None
+        desc = out[1] if len(out) > 1 else None
+    if kpts_norm is None:
+        return np.zeros((0, 2), dtype=np.float64), None
+    # ALIKED returns keypoints as list of tensors (one per batch); take batch 0
+    if isinstance(kpts_norm, (list, tuple)):
+        kpts_norm = kpts_norm[0] if kpts_norm else None
+    if desc is not None and isinstance(desc, (list, tuple)):
+        desc = desc[0] if desc else None
+    if kpts_norm is None:
+        return np.zeros((0, 2), dtype=np.float64), None
+    kpts_norm = kpts_norm.cpu().numpy()
+    if desc is not None:
+        desc = desc.cpu().numpy()
+    if len(kpts_norm.shape) == 3:
+        kpts_norm = kpts_norm[0]
+    if desc is not None and len(desc.shape) == 3:
+        desc = desc[0]
+    kpts_px = kpts_norm.copy()
+    kpts_px[:, 0] = (kpts_px[:, 0] + 1) * 0.5 * max_dim - pad_left
+    kpts_px[:, 1] = (kpts_px[:, 1] + 1) * 0.5 * max_dim - pad_top
+    valid_mask = (kpts_px[:, 0] >= 0) & (kpts_px[:, 0] < orig_w) & (kpts_px[:, 1] >= 0) & (kpts_px[:, 1] < orig_h)
+    kpts_valid = kpts_px[valid_mask]
+    desc_valid = desc[valid_mask] if desc is not None else None
+    return kpts_valid, desc_valid
+
+
+def load_model_runner(model_path):
+    """
+    Load a model from path and return (label, run_fn).
+    run_fn(frame) -> (keypoints, descriptors).
+    Extension: .onnx -> ONNX, .tflite -> TFLite, .pth -> PyTorch.
+    """
+    path = Path(model_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Model not found: {model_path}")
+    ext = path.suffix.lower()
+    label = path.name
+
+    if ext == '.onnx':
+        sess = onnxruntime.InferenceSession(str(path), providers=['CPUExecutionProvider'])
+        def run(frame):
+            return process_frame_onnx(frame, sess)
+        return label, run
+
+    if ext == '.tflite':
+        if _tflite_module is None:
+            raise ImportError("TFLite runtime not found. Install tflite-runtime or tensorflow.")
+        interp = _load_tflite_interpreter(str(path))
+        def run(frame):
+            return process_frame_tflite(frame, interp)
+        return label, run
+
+    if ext == '.pth':
+        model, device = _load_pytorch_model(str(path))
+        def run(frame):
+            return process_frame_pytorch(frame, model, device)
+        return label, run
+
+    raise ValueError(f"Unsupported model extension: {ext}. Use .onnx, .tflite, or .pth (path={model_path})")
 
 
 def process_frame_tflite(frame, interpreter):
@@ -382,24 +601,24 @@ def draw_point_with_outline(frame, x, y, color, radius=10, outline_width=4):
     cv2.circle(frame, (xi, yi), radius, color, -1)
 
 
-def draw_overlap_classified(frame, kpts_onnx, kpts_tflite, overlap, radius=10, outline_width=4):
+def draw_overlap_classified(frame, kpts_a, kpts_b, overlap, radius=10, outline_width=4):
     """
-    Draw keypoints: overlapping=green, ONNX-only=blue, TFLite-only=red. All with black outline.
+    Draw keypoints: overlapping=green, A-only=blue, B-only=red. All with black outline.
     """
     matched_a = set(overlap['matched_a_indices'])
     matched_b = set(overlap['matched_b_indices'])
-    num_a = len(kpts_onnx)
-    num_b = len(kpts_tflite)
+    num_a = len(kpts_a)
+    num_b = len(kpts_b)
     for i in matched_a:
-        x, y = kpts_onnx[i][0], kpts_onnx[i][1]
+        x, y = kpts_a[i][0], kpts_a[i][1]
         draw_point_with_outline(frame, x, y, (0, 255, 0), radius=radius, outline_width=outline_width)
     for i in range(num_a):
         if i not in matched_a:
-            x, y = kpts_onnx[i][0], kpts_onnx[i][1]
+            x, y = kpts_a[i][0], kpts_a[i][1]
             draw_point_with_outline(frame, x, y, (255, 0, 0), radius=radius, outline_width=outline_width)
     for j in range(num_b):
         if j not in matched_b:
-            x, y = kpts_tflite[j][0], kpts_tflite[j][1]
+            x, y = kpts_b[j][0], kpts_b[j][1]
             draw_point_with_outline(frame, x, y, (0, 0, 255), radius=radius, outline_width=outline_width)
     return frame
 
@@ -415,28 +634,17 @@ def get_image_files(directory):
 
 
 def main():
-    """Main program: compare ONNX (ALIKED) vs TFLite (ALIKED) on a directory of images and save metrics."""
+    """Main program: compare two models (by path; .onnx / .tflite / .pth) on a directory of images."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    metrics_output_path = os.path.join(script_dir, 'aliked_onnx_vs_tflite_metrics.txt')
+    metrics_output_path = os.path.join(script_dir, 'aliked_compare_metrics.txt')
     match_radius_px = DEFAULT_MATCH_RADIUS_PX
 
-    if not os.path.isfile(model_onnx_path):
-        raise FileNotFoundError(f"ONNX model not found: {model_onnx_path}")
-    sess_onnx = onnxruntime.InferenceSession(model_onnx_path, providers=['CPUExecutionProvider'])
-    print(f'Loaded ONNX model (ALIKED): {model_onnx_path}')
-
-    tflite_interpreter = None
-    if not SKIP_TFLITE:
-        if not os.path.isfile(model_tflite_path):
-            raise FileNotFoundError(f"TFLite model not found: {model_tflite_path}")
-        if _tflite_module is None:
-            raise ImportError("TFLite runtime not found. Install tflite-runtime or tensorflow, or set SKIP_TFLITE=1")
-        tflite_interpreter = _load_tflite_interpreter(model_tflite_path)
-        if tflite_interpreter is None:
-            raise RuntimeError(f"Failed to load TFLite model: {model_tflite_path}")
-        print(f'Loaded TFLite model: {model_tflite_path}')
-    else:
-        print('TFLite skipped (SKIP_TFLITE=1)')
+    print(f'Model A: {model_a_path}')
+    label_a, run_a = load_model_runner(model_a_path)
+    print(f'  Loaded: {label_a}')
+    print(f'Model B: {model_b_path}')
+    label_b, run_b = load_model_runner(model_b_path)
+    print(f'  Loaded: {label_b}')
 
     image_files = get_image_files(image_dir)
     if not image_files:
@@ -472,16 +680,12 @@ def main():
         processed_count += 1
         h, w = frame.shape[:2]
 
-        kpts_onnx, desc_onnx = process_frame_onnx(frame, sess_onnx)
-        if tflite_interpreter is not None:
-            kpts_tflite, desc_tflite = process_frame_tflite(frame, tflite_interpreter)
-        else:
-            kpts_tflite = np.zeros((0, 2), dtype=np.float64)
-            desc_tflite = None
+        kpts_a, desc_a = run_a(frame)
+        kpts_b, desc_b = run_b(frame)
 
-        overlap = keypoint_spatial_overlap(kpts_onnx, kpts_tflite, radius_px=match_radius_px)
-        rep = repeatability(kpts_onnx, kpts_tflite, radius_px=match_radius_px)
-        similarities_list, avg_sim = compute_cosine_similarity_matched(desc_onnx, desc_tflite, overlap)
+        overlap = keypoint_spatial_overlap(kpts_a, kpts_b, radius_px=match_radius_px)
+        rep = repeatability(kpts_a, kpts_b, radius_px=match_radius_px)
+        similarities_list, avg_sim = compute_cosine_similarity_matched(desc_a, desc_b, overlap)
 
         sum_recall += overlap['recall']
         sum_precision += overlap['precision']
@@ -493,19 +697,19 @@ def main():
         sum_unique_to_a += overlap['num_unique_to_a']
         sum_unique_to_b += overlap['num_unique_to_b']
 
-        n_onnx = overlap['num_a']
-        n_tflite = overlap['num_b']
+        n_a = overlap['num_a']
+        n_b = overlap['num_b']
         n_matched = overlap['num_correspondences']
-        ratio_onnx_tflite = n_onnx / n_tflite if n_tflite else 0.0
+        ratio_a_b = n_a / n_b if n_b else 0.0
         min_sim = float(np.min(similarities_list)) if similarities_list else 0.0
         max_sim = float(np.max(similarities_list)) if similarities_list else 0.0
         std_sim = float(np.std(similarities_list)) if len(similarities_list) > 1 else 0.0
 
         line = (
-            f"image={image_path.name} onnx_count={n_onnx} tflite_count={n_tflite} matched_count={n_matched} "
-            f"ratio_onnx_tflite={ratio_onnx_tflite:.2f} recall={overlap['recall']:.4f} precision={overlap['precision']:.4f} "
+            f"image={image_path.name} count_a={n_a} count_b={n_b} matched_count={n_matched} "
+            f"ratio_a_b={ratio_a_b:.2f} recall={overlap['recall']:.4f} precision={overlap['precision']:.4f} "
             f"overlapping_point_ratio={rep:.4f} reliability={rep:.4f} overlap_pct={overlap['overlap_pct']:.4f} "
-            f"unique_to_onnx={overlap['num_unique_to_a']} unique_to_tflite={overlap['num_unique_to_b']} "
+            f"unique_to_a={overlap['num_unique_to_a']} unique_to_b={overlap['num_unique_to_b']} "
             f"avg_cosine_similarity={avg_sim:.4f} min_similarity={min_sim:.4f} max_similarity={max_sim:.4f} std_similarity={std_sim:.4f}"
         )
         per_image_lines.append(line)
@@ -515,13 +719,13 @@ def main():
             per_image_avg_similarities.append(avg_sim)
 
         vis = frame.copy()
-        draw_overlap_classified(vis, kpts_onnx, kpts_tflite, overlap, radius=10, outline_width=4)
+        draw_overlap_classified(vis, kpts_a, kpts_b, overlap, radius=10, outline_width=4)
         font = cv2.FONT_HERSHEY_SIMPLEX
         cv2.putText(vis, f'Green: overlap ({overlap["num_correspondences"]})', (10, 28), font, 0.6, (0, 255, 0), 2)
-        cv2.putText(vis, f'Blue: ONNX only ({overlap["num_unique_to_a"]})', (10, 52), font, 0.6, (255, 0, 0), 2)
-        cv2.putText(vis, f'Red: TFLite only ({overlap["num_unique_to_b"]})', (10, 76), font, 0.6, (0, 0, 255), 2)
+        cv2.putText(vis, f'Blue: {label_a} only ({overlap["num_unique_to_a"]})', (10, 52), font, 0.6, (255, 0, 0), 2)
+        cv2.putText(vis, f'Red: {label_b} only ({overlap["num_unique_to_b"]})', (10, 76), font, 0.6, (0, 0, 255), 2)
         cv2.putText(vis, f'{image_path.name} ({processed_count}/{total_images})', (10, vis.shape[0] - 10), font, 0.6, (255, 255, 255), 1)
-        cv2.imshow('ALIKED ONNX vs ALIKED TFLite', vis)
+        cv2.imshow(f'{label_a} vs {label_b}', vis)
 
         if processed_count % 10 == 0 or processed_count == total_images:
             print(f'Processed {processed_count}/{total_images} - {image_path.name} - recall={overlap["recall"]:.3f} precision={overlap["precision"]:.3f} repeatability={rep:.3f}')
@@ -539,34 +743,35 @@ def main():
     # Write metrics to txt (same metrics and naming as compare-aliked.py)
     n = processed_count
     with open(metrics_output_path, 'w') as f:
-        f.write("ALIKED ONNX vs ALIKED TFLite - Keypoint comparison metrics\n")
-        f.write("ONNX: aliked-n16_640x640_512kp.onnx  |  TFLite: aliked-n16_fp16.tflite\n")
+        f.write("Keypoint comparison metrics (Model A vs Model B)\n")
+        f.write(f"Model A: {model_a_path}\n")
+        f.write(f"Model B: {model_b_path}\n")
         f.write("=" * 72 + "\n")
         f.write(f"Image directory: {image_dir}\n")
         f.write(f"Images processed: {n}\n")
         f.write(f"Match radius (spatial threshold): {match_radius_px} px\n\n")
 
         f.write("--- Aggregate statistics (averages over all images) ---\n")
-        f.write(f"  Average ONNX keypoints:    {sum_num_a / n:.1f}\n")
-        f.write(f"  Average TFLite keypoints:  {sum_num_b / n:.1f}\n")
+        f.write(f"  Average keypoints (A): {sum_num_a / n:.1f}\n")
+        f.write(f"  Average keypoints (B): {sum_num_b / n:.1f}\n")
         f.write(f"  Average matched keypoints: {sum_correspondences / n:.1f}\n\n")
 
         f.write("--- Recall ---\n")
-        f.write(f"  Recall (fraction of ONNX keypoints with a match in TFLite): {sum_recall / n:.4f}\n\n")
+        f.write(f"  Recall (fraction of A keypoints with a match in B): {sum_recall / n:.4f}\n\n")
 
         f.write("--- Precision ---\n")
-        f.write(f"  Precision (fraction of TFLite keypoints with a match in ONNX): {sum_precision / n:.4f}\n\n")
+        f.write(f"  Precision (fraction of B keypoints with a match in A): {sum_precision / n:.4f}\n\n")
 
         f.write("--- Overlapping point ratio ---\n")
-        f.write(f"  Overlapping point ratio (correspondences / min(onnx, tflite)): {sum_repeatability / n:.4f}\n\n")
+        f.write(f"  Overlapping point ratio (correspondences / min(A, B)): {sum_repeatability / n:.4f}\n\n")
 
         f.write("--- Reliability ---\n")
         f.write(f"  Reliability (same as overlapping point ratio): {sum_repeatability / n:.4f}\n\n")
 
         f.write("--- Overlap percentage ---\n")
-        f.write(f"  Overlap %% (2*correspondences/(num_onnx+num_tflite)): {sum_overlap_pct / n:.4f}\n")
-        f.write(f"  Avg keypoints unique to ONNX:   {sum_unique_to_a / n:.1f}\n")
-        f.write(f"  Avg keypoints unique to TFLite: {sum_unique_to_b / n:.1f}\n\n")
+        f.write(f"  Overlap %% (2*correspondences/(num_A+num_B)): {sum_overlap_pct / n:.4f}\n")
+        f.write(f"  Avg keypoints unique to A: {sum_unique_to_a / n:.1f}\n")
+        f.write(f"  Avg keypoints unique to B: {sum_unique_to_b / n:.1f}\n\n")
 
         f.write("--- Cosine similarity (matched pairs) ---\n")
         if count_with_similarity > 0 and per_image_avg_similarities:
@@ -580,7 +785,7 @@ def main():
             f.write("  No descriptor matches (descriptors may be unavailable from model).\n")
         f.write("\n")
 
-        f.write("--- Per-image metrics (onnx_count, tflite_count, matched_count, ratio_onnx_tflite, recall, precision, overlapping_point_ratio, reliability, overlap_pct, cosine similarity) ---\n\n")
+        f.write("--- Per-image metrics (count_a, count_b, matched_count, ratio_a_b, recall, precision, overlapping_point_ratio, reliability, overlap_pct, cosine similarity) ---\n\n")
         for line in per_image_lines:
             f.write(line + "\n\n")
 
