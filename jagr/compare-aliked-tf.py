@@ -7,6 +7,7 @@ Both model files are expected in the same directory.
 
 import onnxruntime
 import os
+import sys
 import numpy as np
 import cv2
 import matplotlib
@@ -15,15 +16,24 @@ from scipy.spatial.distance import cdist
 from sklearn.metrics.pairwise import cosine_similarity
 from pathlib import Path
 
-# Prefer tflite_runtime (often works with FP16 models); fall back to tensorflow.lite
+# Data and model paths (same layout as aliked_compare_stats_vid.py)
+jagr_data_base = '/Users/antlowhur/Documents/Programming/jagr-data/'
+image_dir = os.path.join(jagr_data_base, 'data/vanafi_polygon_6_18_2020_300msq_121m_altitude/data')
+# TFLite model to compare against ONNX (set ALIKED_TFLITE_PATH env to override)
+aliked_tflite_path = os.path.join(jagr_data_base, 'models', 'aliked-n16_fp16.tflite')
+# Set SKIP_TFLITE=1 to run ONNX-only (avoids TFLite segfaults on some systems)
+SKIP_TFLITE = os.environ.get('SKIP_TFLITE', '').strip().lower() in ('1', 'true', 'yes')
+
+# Import TFLite only when not skipping (avoids segfault on import when SKIP_TFLITE=1)
 _tflite_module = None
-try:
-    import tflite_runtime.interpreter as _tflite_module
-except ImportError:
+if not SKIP_TFLITE:
     try:
-        import tensorflow.lite as _tflite_module
+        import tflite_runtime.interpreter as _tflite_module
     except ImportError:
-        pass
+        try:
+            import tensorflow.lite as _tflite_module
+        except ImportError:
+            pass
 
 
 def _load_tflite_interpreter(model_path):
@@ -334,7 +344,7 @@ def get_image_files(directory):
 
 
 def process_single_image(image_path, aliked_onnx_sess, aliked_tflite_interpreter, show_plot=True):
-    """Process a single image and compare ONNX vs TFLite models."""
+    """Process a single image and compare ONNX vs TFLite models (TFLite optional if interpreter is None)."""
     print(f'\n{"="*60}')
     print(f'Processing: {image_path.name}')
     print(f'{"="*60}')
@@ -347,26 +357,35 @@ def process_single_image(image_path, aliked_onnx_sess, aliked_tflite_interpreter
     h, w = image.shape[:2]
     print(f'Image dimensions: {w}x{h}')
 
-    print('\nProcessing image with both models...')
+    onnx_only = aliked_tflite_interpreter is None
+    print('\nProcessing image with ONNX...')
     kpts_onnx, desc_onnx = process_aliked_onnx(image, aliked_onnx_sess, 'ONNX')
-    kpts_tflite, desc_tflite = process_aliked_tflite(image, aliked_tflite_interpreter, 'TFLite')
+    if onnx_only:
+        kpts_tflite, desc_tflite = np.zeros((0, 2), dtype=np.float64), None
+    else:
+        print('Processing image with TFLite...')
+        kpts_tflite, desc_tflite = process_aliked_tflite(image, aliked_tflite_interpreter, 'TFLite')
 
     print('\n' + '-'*60)
-    print('COMPARING ONNX vs TFLite')
+    print('COMPARING ONNX vs TFLite' if not onnx_only else 'ONNX ONLY (TFLite skipped)')
     print('-'*60)
 
     onnx_count = len(kpts_onnx)
     tflite_count = len(kpts_tflite)
     print(f'ONNX keypoints:    {onnx_count}')
-    print(f'TFLite keypoints: {tflite_count}')
-    print(f'Difference:        {onnx_count - tflite_count:+d} ({((onnx_count - tflite_count) / max(onnx_count, 1) * 100):+.1f}%)')
-    if tflite_count > 0:
-        print(f'Ratio (ONNX/TFLite): {onnx_count / tflite_count:.2f}x')
+    if not onnx_only:
+        print(f'TFLite keypoints: {tflite_count}')
+        print(f'Difference:        {onnx_count - tflite_count:+d} ({((onnx_count - tflite_count) / max(onnx_count, 1) * 100):+.1f}%)')
+        if tflite_count > 0:
+            print(f'Ratio (ONNX/TFLite): {onnx_count / tflite_count:.2f}x')
 
-    print('\nComputing cosine similarity...')
-    matched_pairs, similarities, avg_similarity = compute_cosine_similarity(
-        kpts_onnx, desc_onnx, kpts_tflite, desc_tflite, spatial_threshold=10.0
-    )
+    if not onnx_only:
+        print('\nComputing cosine similarity...')
+        matched_pairs, similarities, avg_similarity = compute_cosine_similarity(
+            kpts_onnx, desc_onnx, kpts_tflite, desc_tflite, spatial_threshold=10.0
+        )
+    else:
+        matched_pairs, similarities, avg_similarity = [], [], 0.0
 
     if len(matched_pairs) > 0:
         print(f'Matched keypoints:    {len(matched_pairs)}/{onnx_count} ({len(matched_pairs)/max(onnx_count, 1)*100:.1f}%)')
@@ -374,12 +393,15 @@ def process_single_image(image_path, aliked_onnx_sess, aliked_tflite_interpreter
         print(f'Min similarity:        {np.min(similarities):.4f}')
         print(f'Max similarity:        {np.max(similarities):.4f}')
         print(f'Std similarity:        {np.std(similarities):.4f}')
-    else:
+    elif not onnx_only:
         print('No matched keypoints found within spatial threshold')
 
     if show_plot:
         print('\nCreating visualization...')
-        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+        n_plots = 1 if onnx_only else 2
+        fig, axes = plt.subplots(1, n_plots, figsize=(8 * n_plots, 8))
+        if n_plots == 1:
+            axes = [axes]
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         ax = axes[0]
@@ -388,21 +410,39 @@ def process_single_image(image_path, aliked_onnx_sess, aliked_tflite_interpreter
                    edgecolors='black', linewidths=0.5, zorder=10)
         ax.set_xlim(0, w)
         ax.set_ylim(h, 0)
-        ax.set_title(f'ONNX ALIKED\n{onnx_count} keypoints', fontsize=12, fontweight='bold')
+        ax.set_title(f'ONNX ALIKED\n{onnx_count} feature points', fontsize=12, fontweight='bold')
+        ax.text(0.02, 0.98, f'ONNX: {onnx_count} feature points', transform=ax.transAxes,
+                fontsize=11, verticalalignment='top', color='white', weight='bold',
+                bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
         ax.axis('off')
 
-        ax = axes[1]
-        ax.imshow(image_rgb)
-        ax.scatter(kpts_tflite[:, 0], kpts_tflite[:, 1], c='lightblue', s=8, alpha=0.7,
-                   edgecolors='black', linewidths=0.5, zorder=10)
-        ax.set_xlim(0, w)
-        ax.set_ylim(h, 0)
-        ax.set_title(f'TFLite ALIKED\n{tflite_count} keypoints', fontsize=12, fontweight='bold')
-        ax.axis('off')
+        if not onnx_only:
+            ax = axes[1]
+            ax.imshow(image_rgb)
+            ax.scatter(kpts_tflite[:, 0], kpts_tflite[:, 1], c='lightblue', s=8, alpha=0.7,
+                       edgecolors='black', linewidths=0.5, zorder=10)
+            ax.set_xlim(0, w)
+            ax.set_ylim(h, 0)
+            ax.set_title(f'TFLite ALIKED\n{tflite_count} feature points', fontsize=12, fontweight='bold')
+            ax.text(0.02, 0.98, f'TFLite: {tflite_count} feature points', transform=ax.transAxes,
+                    fontsize=11, verticalalignment='top', color='white', weight='bold',
+                    bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+            ax.axis('off')
 
-        similarity_text = f'Avg Cosine Similarity: {avg_similarity:.4f}' if len(matched_pairs) > 0 else 'No matches'
-        plt.suptitle(f'{image_path.name}: ONNX ({onnx_count} kpts) vs TFLite ({tflite_count} kpts)\n{similarity_text}',
-                     fontsize=14, fontweight='bold')
+        n_overlap = len(matched_pairs)
+        if not onnx_only and (onnx_count > 0 or tflite_count > 0):
+            pct_onnx = 100.0 * n_overlap / onnx_count if onnx_count else 0.0
+            pct_tflite = 100.0 * n_overlap / tflite_count if tflite_count else 0.0
+            #overlap_text = f'Overlapping: {n_overlap} pts ({pct_onnx:.1f}% of ONNX, {pct_tflite:.1f}% of TFLite)'
+            overlap_text = f'Overlapping: {n_overlap} pts ({pct_tflite:.1f}%)'
+        else:
+            overlap_text = ''
+        similarity_text = f'Avg Cosine Similarity: {avg_similarity:.4f}' if len(matched_pairs) > 0 else ('No matches' if not onnx_only else 'ONNX only')
+        title_lines = [f'{image_path.name}: ONNX ({onnx_count} pts)' + (f' vs TFLite ({tflite_count} pts)' if not onnx_only else '')]
+        if overlap_text:
+            title_lines.append(overlap_text)
+        title_lines.append(similarity_text)
+        plt.suptitle('\n'.join(title_lines), fontsize=14, fontweight='bold')
         plt.tight_layout()
         if matplotlib.get_backend().lower() == 'agg':
             compare_dir = image_path.parent / 'compare'
@@ -428,26 +468,42 @@ def process_single_image(image_path, aliked_onnx_sess, aliked_tflite_interpreter
 
 def main():
     """Main program."""
-    jagr_data_dir = '/home/anthony/Documents/Programming/reveal/jagr-data'
-    image_dir = '/home/anthony/Documents/Programming/reveal/jagr-data/data/vanafi_polygon_6_18_2020_300msq_121m_altitude/data'
-
-    # Both models in the same directory
-    models_dir = os.path.join(jagr_data_dir, 'models')
+    print('compare-aliked-tf: main started.')
+    models_dir = os.path.join(jagr_data_base, 'models')
     aliked_onnx_path = os.path.join(models_dir, 'aliked-n16_640x640_512kp.onnx')
 
     if not os.path.isfile(aliked_onnx_path):
         raise FileNotFoundError(f"ONNX model not found: {aliked_onnx_path}")
 
-    if _tflite_module is None:
-        raise ImportError(
-            "No TFLite runtime found. Install one of: pip install tflite-runtime  OR  pip install tensorflow"
-        )
+    if not SKIP_TFLITE:
+        tflite_path = os.environ.get('ALIKED_TFLITE_PATH', '').strip() or aliked_tflite_path
+        if not os.path.isfile(tflite_path):
+            raise FileNotFoundError(f"TFLite model not found: {tflite_path}")
+        if _tflite_module is None:
+            raise ImportError(
+                "No TFLite runtime found. Install one of: pip install tflite-runtime  OR  pip install tensorflow"
+            )
 
     print('Loading ALIKED models...')
     print('  Loading ONNX model...')
+    sys.stdout.flush()
+    sys.stderr.flush()
     aliked_onnx_sess = onnxruntime.InferenceSession(aliked_onnx_path, providers=['CPUExecutionProvider'])
-    print('  Loading TFLite model...')
-    aliked_tflite_interpreter, _tflite_path_used = _resolve_and_load_tflite(models_dir)
+    print('  ONNX loaded.')
+    sys.stdout.flush()
+
+    aliked_tflite_interpreter = None
+    if not SKIP_TFLITE:
+        print('  Loading TFLite model...')
+        sys.stdout.flush()
+        aliked_tflite_interpreter, errs = _load_tflite_interpreter(tflite_path)
+        if aliked_tflite_interpreter is None:
+            raise RuntimeError(
+                f"Failed to load TFLite model: {tflite_path}\n" + "\n".join(errs)
+            )
+        print(f'  TFLite loaded: {tflite_path}')
+    else:
+        print('  TFLite skipped (SKIP_TFLITE=1).')
     print('Models loaded!\n')
 
     image_files = get_image_files(image_dir)
