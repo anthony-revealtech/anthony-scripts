@@ -119,10 +119,12 @@ def process_image(sess, image_path, video_writer_ref):
         patch_vis = draw_points_on_image(patch, kpts_local)
         patch_images_with_points.append(patch_vis)
 
-    # 1) Show 9 separate windows, one per patch
+    # 1) Show 9 separate windows, one per patch (resized to half size)
     for idx in range(N_PATCHES):
         patch_vis = patch_images_with_points[idx]
-        cv2.imshow(f'Patch {idx}', patch_vis)
+        ph, pw = patch_vis.shape[:2]
+        patch_small = cv2.resize(patch_vis, (pw // 4, ph // 4))
+        cv2.imshow(f'Patch {idx}', patch_small)
     cv2.waitKey(300)
 
     # 2) Combined full image with all points and black lines dividing the 9 patches
